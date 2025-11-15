@@ -1,0 +1,6 @@
+countries:
+  - NL
+  - FR
+  - BE
+dataset:
+  input_folder: data/
