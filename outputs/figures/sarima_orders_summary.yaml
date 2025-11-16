@@ -1,0 +1,30 @@
+BE:
+  order: !!python/tuple
+  - 1
+  - 1
+  - 0
+  seasonal_order: !!python/tuple
+  - 2
+  - 1
+  - 0
+  - 24
+DK:
+  order: !!python/tuple
+  - 1
+  - 1
+  - 1
+  seasonal_order: !!python/tuple
+  - 2
+  - 1
+  - 0
+  - 24
+NL:
+  order: !!python/tuple
+  - 1
+  - 1
+  - 2
+  seasonal_order: !!python/tuple
+  - 2
+  - 1
+  - 0
+  - 24
