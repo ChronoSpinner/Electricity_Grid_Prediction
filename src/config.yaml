@@ -1,6 +1,75 @@
+# OPSD PowerDesk Assignment Configuration
+
 countries:
-  - NL
-  - DK
   - BE
+  - DK
+  - NL
+
 dataset:
-  input_folder: data/
+  input_folder: 'data'
+  raw_csv: 'opsd_time_series_60min_singleindex.csv'
+
+decomposition:
+  seasonality: 24  # Daily seasonality (hourly data)
+  stl_period: 24
+  acf_pacf_lags: 48
+
+sarima:
+  # Grid search ranges (as per PDF defaults)
+  p_range: [0,1] #analized from PACF plot
+  d_range: [1] # slight trend in the data, observing acf and pacf at d=0 and d=1 with D=1 at d=0 the acf plot was decaying constantly but at d=1 it shows spikes at lag 1 strongly signifying d=1 and p=1 as well
+  q_range: [0,1,2] # couldnt accuratly determine from ACF plot for different countries
+  P_range: [1,2] # from seasonal PACF plot
+  D_range: [1] # visisble seasonal difference
+  Q_range: [0] #from seasonal ACF plot
+  s: 24
+
+forecasting:
+  train_ratio: 0.80
+  val_ratio: 0.10
+  test_ratio: 0.10
+  warmup_days: 60      # Minimum 60 days of history
+  horizon: 24          # 24-step ahead
+  stride: 24           # Daily updates (24 hours)
+  confidence_level: 0.80  # 80% prediction intervals
+  
+  # SARIMAX exogenous features
+  use_exogenous: true
+  include_calendar_features: true  # Hour-of-day, day-of-week
+  include_wind: true
+  include_solar: true
+
+anomaly:
+  zscore_window: 336   # 14 days = 336 hours
+  zscore_threshold: 3.0
+  zscore_min_periods: 168  # 7 days
+  cusum_k: 0.5
+  cusum_h: 5.0
+  cusum_threshold: 3.0
+
+anomaly_ml:
+  high_z_threshold: 3.5
+  med_z_threshold: 2.5
+  low_z_threshold: 1.0
+  test_sample_size: 100  # 50 positive, 50 negative
+  
+live_simulation:
+  start_history_days: 120
+  simulate_hours: 2000
+  adaptation_strategy: 'rolling_sarimax'  # Options: 'rolling_sarimax', 'tiny_neural'
+  rolling_sarimax_days: 90
+  neural_finetune_days: 14
+  drift_threshold: 0.95  # 95th percentile EWMA
+
+metrics:
+  seasonality: 24
+  primary: 'MASE'
+
+outputs:
+  folder: 'outputs'
+  figures_folder: 'outputs/figures'
+  forecasts_folder: 'outputs/forecasts'
+  models_folder: 'outputs/models'
+  metrics_folder: 'outputs/metrics'
+  anomalies_folder: 'outputs/anomalies'
+  live_folder: 'outputs/live'
