@@ -1,486 +1,343 @@
-"""
-forecast.py
--------------------
-Part 2: Day-Ahead 24-Step Forecasting with SARIMAX + GRU/LSTM (BE, DK, NL)
-
-Implements BOTH:
-- 2.2.i: Required SARIMAX with exogenous features
-- 2.2.iii: Optional GRU/LSTM for comparison/bonus
-
-GRU Architecture:
-- Input: Last 168 hours (7 days)
-- Output: Next 24 hours
-- Multi-horizon direct forecasting
-"""
-
 import os
-import yaml
-import pandas as pd
-import numpy as np
 import warnings
-import json
-import pickle
-from tqdm import tqdm
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-
+import yaml
+import numpy as np
+import pandas as pd
+from typing import Dict, Tuple, Optional
+import time
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-from load_opsd import load_tidy_country_csvs_from_config
-from exogenous_features import prepare_exogenous_for_sarimax
-from metrics import calculate_mase, calculate_smape, calculate_metrics
 
-warnings.filterwarnings('ignore')
-
-# Check GPU availability
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {DEVICE}")
-
-
-# ================================================================================
-# GRU MODEL ARCHITECTURE
-# ================================================================================
-
-class GRUForecaster(nn.Module):
-    """
-    GRU-based multi-horizon forecaster
-    Input: Last 168 hours (7 days)
-    Output: Next 24 hours
-    """
-    def __init__(self, input_size=1, hidden_size=64, num_layers=2, output_horizon=24, dropout=0.2):
-        super(GRUForecaster, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.output_horizon = output_horizon
-        
-        # GRU layers
-        self.gru = nn.GRU(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(hidden_size, 128)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(128, output_horizon)
-    
-    def forward(self, x):
-        """
-        Args:
-            x: (batch, seq_len=168, input_size=1)
-        Returns:
-            output: (batch, output_horizon=24)
-        """
-        # GRU forward
-        gru_out, _ = self.gru(x)  # (batch, seq_len, hidden_size)
-        last_hidden = gru_out[:, -1, :]  # (batch, hidden_size)
-        
-        # Fully connected layers
-        fc_out = self.fc1(last_hidden)  # (batch, 128)
-        fc_out = self.relu(fc_out)
-        fc_out = self.dropout(fc_out)
-        output = self.fc2(fc_out)  # (batch, 24)
-        
-        return output
+try:
+    from .load_opsd import load_tidy_country_csvs_from_config
+    from .exogenous_features import prepare_endog_exog, build_future_exogenous
+except ImportError:
+    # Fallback for running as a plain script: python src/forecast.py
+    from load_opsd import load_tidy_country_csvs_from_config
+    from exogenous_features import prepare_endog_exog, build_future_exogenous
 
 
-# ================================================================================
-# DATASET CLASS
-# ================================================================================
-
-class TimeSeriesDataset(Dataset):
-    """
-    Creates sequences for GRU training
-    Input: Last 168 hours
-    Output: Next 24 hours
-    """
-    def __init__(self, data, lookback=168, horizon=24):
-        self.data = data
-        self.lookback = lookback
-        self.horizon = horizon
-        self.len = len(data) - lookback - horizon + 1
-    
-    def __len__(self):
-        return self.len
-    
-    def __getitem__(self, idx):
-        x = self.data[idx:idx + self.lookback]  # (168,)
-        y = self.data[idx + self.lookback:idx + self.lookback + self.horizon]  # (24,)
-        
-        x = torch.FloatTensor(x).unsqueeze(-1)  # (168, 1)
-        y = torch.FloatTensor(y)  # (24,)
-        
-        return x, y
+warnings.filterwarnings("ignore")
+DEFAULT_CONFIG_PATH = os.path.join('src', 'config.yaml')
 
 
-# ================================================================================
-# TRAINING FUNCTIONS
-# ================================================================================
-
-def train_gru_model(y_series, epochs=50, batch_size=32, lookback=168, horizon=24):
-    """
-    Train GRU model on time series data
-    """
-    print(f"\n🧠 Training GRU model...")
-    print(f"   Data shape: {y_series.shape}")
-    print(f"   Lookback: {lookback}h, Horizon: {horizon}h")
-    print(f"   Device: {DEVICE}")
-    
-    # Normalize data
-    mean = y_series.mean()
-    std = y_series.std()
-    y_normalized = (y_series - mean) / std
-    
-    # Create dataset and dataloader
-    dataset = TimeSeriesDataset(y_normalized.values, lookback=lookback, horizon=horizon)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    # Initialize model
-    model = GRUForecaster(
-        input_size=1, 
-        hidden_size=64, 
-        num_layers=2, 
-        output_horizon=horizon, 
-        dropout=0.2
-    ).to(DEVICE)
-    
-    # Loss and optimizer
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=False)
-    
-    # Training loop
-    best_loss = float('inf')
-    print(f"\n   Epoch | Train Loss")
-    print(f"   ------|----------")
-    
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        
-        for x_batch, y_batch in dataloader:
-            x_batch = x_batch.to(DEVICE)
-            y_batch = y_batch.to(DEVICE)
-            
-            # Forward pass
-            y_pred = model(x_batch)
-            loss = criterion(y_pred, y_batch)
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            
-            total_loss += loss.item()
-        
-        avg_loss = total_loss / len(dataloader)
-        scheduler.step(avg_loss)
-        
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"   {epoch+1:4d}  | {avg_loss:.6f}")
-        
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-    
-    print(f"   Final loss: {best_loss:.6f}")
-    print(f"   ✅ GRU training complete!")
-    
-    return model, mean, std
+def _log(msg: str):
+    print(f"[{pd.Timestamp.now().strftime('%H:%M:%S')}] {msg}")
 
 
-def gru_forecast_backtest(model, y_series, mean, std, lookback=168, stride=24, horizon=24):
-    """
-    Perform expanding-origin backtest with GRU
-    """
-    forecasts = []
-    model.eval()
-    
-    with torch.no_grad():
-        start_idx = lookback
-        end_idx = len(y_series) - horizon
-        
-        for t in tqdm(range(start_idx, end_idx, stride), desc="GRU Backtest"):
-            # Get last 168 hours (normalized)
-            y_train = (y_series[:t] - mean) / std
-            x_input = y_train.iloc[-lookback:].values  # Last 168 hours
-            
-            # Reshape for model
-            x_input = torch.FloatTensor(x_input).unsqueeze(0).unsqueeze(-1)  # (1, 168, 1)
-            x_input = x_input.to(DEVICE)
-            
-            # Forecast
-            y_pred_normalized = model(x_input).cpu().numpy()[0]  # (24,)
-            y_pred = y_pred_normalized * std + mean  # Denormalize
-            
-            # Get actual values
-            y_actual = y_series.iloc[t:t+horizon].values
-            
-            # Store results
-            for step in range(horizon):
-                forecasts.append({
-                    'timestamp': y_series.index[t+step],
-                    'y_true': y_actual[step],
-                    'yhat': y_pred[step],
-                    'lo': y_pred[step] - 1.96 * std,  # Approximate 80% CI
-                    'hi': y_pred[step] + 1.96 * std,
-                    'horizon': step + 1,
-                    'train_end': t
-                })
-    
-    df_forecast = pd.DataFrame(forecasts)
-    return df_forecast
+def _read_config(path: str) -> dict:
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
 
 
-# ================================================================================
-# MAIN FORECASTING FUNCTION
-# ================================================================================
+def select_sarima_order(
+    y: pd.Series,
+    X: Optional[pd.DataFrame],
+    sarima_cfg: dict
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
+    p_range = sarima_cfg.get('p_range', [0, 1, 2])
+    d_range = sarima_cfg.get('d_range', [0, 1])
+    q_range = sarima_cfg.get('q_range', [0, 1, 2])
+    P_range = sarima_cfg.get('P_range', [0, 1])
+    D_range = sarima_cfg.get('D_range', [0, 1])
+    Q_range = sarima_cfg.get('Q_range', [0, 1])
+    s = sarima_cfg.get('s', 24)
 
-def create_train_val_test_splits(df, train_ratio=0.80, val_ratio=0.10, test_ratio=0.10):
-    """Create chronological splits"""
-    n = len(df)
-    train_end = int(n * train_ratio)
-    val_end = train_end + int(n * val_ratio)
-    
-    df_train = df.iloc[:train_end].copy()
-    df_val = df.iloc[train_end:val_end].copy()
-    df_test = df.iloc[val_end:].copy()
-    
-    return df_train, df_val, df_test
+    best = None
+    best_metrics = (np.inf, np.inf)  # (BIC, AIC)
+    total = len(p_range) * len(d_range) * len(q_range) * len(P_range) * len(D_range) * len(Q_range)
+    count = 0
+    interval = max(1, total // 5)
+    _log(f"Order search: {total} combinations to evaluate (grid from config)")
+    for p in p_range:
+        for d in d_range:
+            for q in q_range:
+                for P in P_range:
+                    for D in D_range:
+                        for Q in Q_range:
+                            order = (p, d, q)
+                            seasonal_order = (P, D, Q, s)
+                            try:
+                                model = SARIMAX(y, exog=X, order=order, seasonal_order=seasonal_order,
+                                                enforce_stationarity=False, enforce_invertibility=False)
+                                res = model.fit(disp=False)
+                                bic, aic = res.bic, res.aic
+                                if (bic < best_metrics[0]) or (np.isclose(bic, best_metrics[0]) and aic < best_metrics[1]):
+                                    best_metrics = (bic, aic)
+                                    best = (order, seasonal_order)
+                            except Exception:
+                                continue
+                            finally:
+                                count += 1
+                                if count % interval == 0 or count == total:
+                                    msg = f"Order search progress: {count}/{total}"
+                                    if best is not None:
+                                        msg += f" | current best order={best[0]}, seasonal={best[1]} (BIC={best_metrics[0]:.1f})"
+                                    _log(msg)
+    if best is None:
+        best = ((1, 1, 0), (1, 1, 0, s))
+    return best
 
 
-def forecast_models_combined(dfs, config_path='src/config.yaml'):
-    """
-    Build BOTH SARIMAX and GRU models
-    - SARIMAX: Required classical model with exogenous features
-    - GRU: Optional neural model for comparison
-    """
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Load SARIMA orders
-    figures_folder = config['outputs']['figures_folder']
-    orders_file = os.path.join(figures_folder, 'sarima_orders_summary.yaml')
-    
-    if not os.path.exists(orders_file):
-        print(f"❌ Error: {orders_file} not found. Run decompose_acfpacf.py first!")
-        return
-    
-    # --- FIX #1: Use UnsafeLoader to read Python tuples ---
-    with open(orders_file, 'r') as f:
-        sarima_orders = yaml.load(f, Loader=yaml.UnsafeLoader)
-    
-    forecasts_folder = config['outputs']['forecasts_folder']
-    models_folder = config['outputs']['models_folder']
-    metrics_folder = config['outputs']['metrics_folder']
-    
-    os.makedirs(forecasts_folder, exist_ok=True)
-    os.makedirs(models_folder, exist_ok=True)
-    os.makedirs(metrics_folder, exist_ok=True)
-    
-    train_ratio = config['forecasting']['train_ratio']
-    val_ratio = config['forecasting']['val_ratio']
-    test_ratio = config['forecasting']['test_ratio']
-    warmup_days = config['forecasting']['warmup_days']
+def expanding_backtest(
+    df: pd.DataFrame,
+    order: Tuple[int, int, int],
+    seasonal_order: Tuple[int, int, int, int],
+    config: dict,
+    include_calendar: bool,
+    include_wind: bool,
+    include_solar: bool,
+    cc: Optional[str] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = df.copy()
+    if 'timestamp' in df.columns:
+        df.set_index('timestamp', inplace=True)
+    df.sort_index(inplace=True)
+
+    y = df['load'].astype(float)
+
+    ratios = config['forecasting']
+    train_ratio = float(ratios.get('train_ratio', 0.8))
+    val_ratio = float(ratios.get('val_ratio', 0.1))
+    test_ratio = float(ratios.get('test_ratio', 0.1))
+
+    n = len(y)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    n_test = n - n_train - n_val
+
+    idx = y.index
+    train_end_ts = idx[n_train - 1]
+    dev_end_ts = idx[n_train + n_val - 1]
+
+    horizon = int(ratios.get('horizon', 24))
+    stride = int(ratios.get('stride', 24))
+    warmup_days = int(ratios.get('warmup_days', 60))
     warmup_hours = warmup_days * 24
-    stride = config['forecasting']['stride']
-    horizon = config['forecasting']['horizon']
-    
-    print("\n" + "="*80)
-    print("PART 2: FORECASTING WITH SARIMAX + GRU")
-    print("="*80)
-    print(f"\nBacktest config:")
-    print(f"  Warmup: {warmup_days} days")
-    print(f"  Stride: {stride}h, Horizon: {horizon}h")
-    print(f"  Train/Val/Test: {train_ratio*100:.0f}/{val_ratio*100:.0f}/{test_ratio*100:.0f}%")
-    
-    all_metrics = {}
-    
-    for cc, df in dfs.items():
-        print(f"\n{'='*80}")
-        print(f"Country: {cc}")
-        print(f"{'='*80}")
-        
-        if cc not in sarima_orders:
-            print(f"❌ No SARIMA order found for {cc}. Skipping...")
-            continue
-        
-        order = tuple(sarima_orders[cc]['order'])
-        seasonal_order = tuple(sarima_orders[cc]['seasonal_order'])
-        print(f"\n✅ SARIMAX{order} x {seasonal_order}")
-        print(f"🧠 GRU (168h → 24h)")
-        
-        # Split data
-        df_train, df_val, df_test = create_train_val_test_splits(df, train_ratio, val_ratio, test_ratio)
-        
-        print(f"\n📊 Data splits:")
-        print(f"   Train: {len(df_train)}, Val: {len(df_val)}, Test: {len(df_test)}")
-        
-        # ================================================================================
-        # SARIMAX FORECASTING
-        # ================================================================================
-        
-        print(f"\n{'─'*40}")
-        print(f"MODEL 1: SARIMAX (Required)")
-        print(f"{'─'*40}")
-        
-        # Prepare exogenous features
-        exog_train = prepare_exogenous_for_sarimax(df_train, include_wind=True, include_solar=True, include_calendar=True)
-        exog_val = prepare_exogenous_for_sarimax(df_val, include_wind=True, include_solar=True, include_calendar=True)
-        exog_test = prepare_exogenous_for_sarimax(df_test, include_wind=True, include_solar=True, include_calendar=True)
-        
-        df_combined = pd.concat([df_train, df_val], ignore_index=True)
-        exog_combined = pd.concat([exog_train, exog_val], ignore_index=True)
-        y_combined = pd.Series(df_combined['load'].values)
-        
-        print(f"🔄 Backtest on Validation set...")
-        
-        # Simple validation forecast (for speed, using rolling window)
-        df_val_forecast = []
-        start_idx = len(df_train)
-        
-        for t in tqdm(range(start_idx, len(df_combined) - horizon, stride), desc="SARIMAX Val"):
-            try:
-                y_train_subset = y_combined[:t]
-                exog_train_subset = exog_combined[:t]
-                exog_future = exog_combined[t:t+horizon]
-                
-                model = SARIMAX(y_train_subset, exog=exog_train_subset, 
-                               order=order, seasonal_order=seasonal_order,
-                               enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
-                
-                result = model.get_forecast(steps=horizon, exog=exog_future)
-                forecast = result.predicted_mean
-                ci = result.conf_int(alpha=0.2)
-                
-                y_actual = df_combined.iloc[t:t+horizon]['load'].values
-                timestamps = df_combined.iloc[t:t+horizon]['timestamp'].values
-                
-                for step in range(horizon):
-                    df_val_forecast.append({
-                        'timestamp': timestamps[step],
-                        'y_true': y_actual[step],
-                        'yhat': forecast.iloc[step],
-                        'lo': ci.iloc[step, 0],
-                        'hi': ci.iloc[step, 1],
-                        'horizon': step + 1,
-                        'train_end': t
-                    })
-            except:
-                continue
-        
-        df_sarimax_val = pd.DataFrame(df_val_forecast)
-        
-        # Save SARIMAX validation forecasts
-        sarimax_val_path = os.path.join(forecasts_folder, f'{cc}_sarimax_forecasts_dev.csv')
-        df_sarimax_val.to_csv(sarimax_val_path, index=False)
-        print(f"💾 SARIMAX dev forecasts: {sarimax_val_path}")
-        
-        # ================================================================================
-        # GRU FORECASTING
-        # ================================================================================
-        
-        print(f"\n{'─'*40}")
-        print(f"MODEL 2: GRU/LSTM (Optional Bonus)")
-        print(f"{'─'*40}")
-        
-        # Train GRU on training data
-        y_train_gru = pd.Series(df_train['load'].values)
-        gru_model, mean, std = train_gru_model(y_train_gru, epochs=50, batch_size=32)
-        
-        # GRU validation forecast
-        y_combined_for_gru = pd.Series(df_combined['load'].values)
-        y_combined_for_gru.index = range(len(y_combined_for_gru))
-        
-        print(f"🔄 Backtest on Validation set...")
-        df_gru_val = gru_forecast_backtest(gru_model, y_combined_for_gru, mean, std, lookback=168, stride=stride, horizon=horizon)
-        
-        # Save GRU validation forecasts
-        gru_val_path = os.path.join(forecasts_folder, f'{cc}_gru_forecasts_dev.csv')
-        df_gru_val.to_csv(gru_val_path, index=False)
-        print(f"💾 GRU dev forecasts: {gru_val_path}")
-        
-        # ================================================================================
-        # METRICS COMPARISON (FIXED)
-        # ================================================================================
-        
-        print(f"\n{'─'*40}")
-        print(f"METRICS COMPARISON")
-        print(f"{'─'*40}")
-        
-        # --- FIX #2: Initialize to infinity to prevent UnboundLocalError ---
-        mase_sarimax = float('inf')
-        mase_gru = float('inf')
-        
-        # SARIMAX metrics
-        if len(df_sarimax_val) > 0:
-            mase_sarimax = calculate_mase(df_sarimax_val['y_true'], df_sarimax_val['yhat'], seasonal=24)
-            smape_sarimax = calculate_smape(df_sarimax_val['y_true'], df_sarimax_val['yhat'])
-            metrics_sarimax = calculate_metrics(df_sarimax_val['y_true'], df_sarimax_val['yhat'])
-            coverage_sarimax = ((df_sarimax_val['y_true'] >= df_sarimax_val['lo']) & 
-                               (df_sarimax_val['y_true'] <= df_sarimax_val['hi'])).mean()
-            
-            print(f"\n📊 SARIMAX (Dev):")
-            print(f"   MASE: {mase_sarimax:.4f}")
-            print(f"   sMAPE: {smape_sarimax:.4f}")
-            print(f"   RMSE: {metrics_sarimax['rmse']:.4f}")
-            print(f"   PI Coverage (80%): {coverage_sarimax:.4f}")
-        else:
-            print("\n⚠️ SARIMAX produced no forecasts (Skipping metrics)")
-        
-        # GRU metrics
-        if len(df_gru_val) > 0:
-            mase_gru = calculate_mase(df_gru_val['y_true'], df_gru_val['yhat'], seasonal=24)
-            smape_gru = calculate_smape(df_gru_val['y_true'], df_gru_val['yhat'])
-            metrics_gru = calculate_metrics(df_gru_val['y_true'], df_gru_val['yhat'])
-            coverage_gru = ((df_gru_val['y_true'] >= df_gru_val['lo']) & 
-                           (df_gru_val['y_true'] <= df_gru_val['hi'])).mean()
-            
-            print(f"\n🧠 GRU (Dev):")
-            print(f"   MASE: {mase_gru:.4f}")
-            print(f"   sMAPE: {smape_gru:.4f}")
-            print(f"   RMSE: {metrics_gru['rmse']:.4f}")
-            print(f"   PI Coverage (80%): {coverage_gru:.4f}")
-            
-            # --- FIX #3: Safe Comparison ---
-            if mase_sarimax != float('inf') and mase_gru != float('inf'):
-                print(f"\n🏆 Winner:")
-                if mase_sarimax <= mase_gru:
-                    print(f"   SARIMAX (MASE: {mase_sarimax:.4f} < {mase_gru:.4f})")
-                else:
-                    print(f"   GRU (MASE: {mase_gru:.4f} < {mase_sarimax:.4f})")
+    conf = float(ratios.get('confidence_level', 0.80))
+    alpha = 1.0 - conf
+
+    fit_history_days = config.get('forecasting', {}).get('fit_history_days', None)
+    fit_window_hours = None
+    if fit_history_days is not None:
+        try:
+            fit_history_days = int(fit_history_days)
+            fit_window_hours = fit_history_days * 24
+            _log(f"[{cc or ''}] Using rolling fit window: last {fit_history_days} days of history per step")
+        except Exception:
+            fit_window_hours = None
+
+    first_ts = idx[0]
+    first_valid_ts = first_ts + pd.Timedelta(hours=warmup_hours)
+
+    def run_segment(start_ts: pd.Timestamp, end_ts: pd.Timestamp, label: str) -> pd.DataFrame:
+        rows = []
+        step_ts = max(start_ts, first_valid_ts)
+        if step_ts > end_ts:
+            _log(f"[{cc or ''}][{label}] No steps (not enough warmup or empty segment)")
+            return pd.DataFrame(columns=['timestamp', 'y_true', 'yhat', 'lo', 'hi', 'horizon', 'train_end'])
+
+        remaining_hours = (end_ts - step_ts).total_seconds() / 3600.0
+        total_steps = int(remaining_hours // stride) + 1
+        progress_every = max(1, total_steps // 10)
+        start_time = time.time()
+        step_idx = 0
+        avg_sec = None
+        _log(f"[{cc or ''}][{label}] Starting backtest: {total_steps} steps from {step_ts} to {end_ts}")
+        while step_ts <= end_ts:
+            loop_start = time.time()
+            if fit_window_hours is not None:
+                start_hist = max(idx[0], step_ts - pd.Timedelta(hours=fit_window_hours))
+                y_hist = y.loc[start_hist:step_ts]
+                ref_df = df.loc[start_hist:step_ts]
             else:
-                print("\nℹ️  Cannot determine winner (one or both models failed).")
-        
-        # Save models
-        model_sarimax_path = os.path.join(models_folder, f'{cc}_sarimax_model.pkl')
-        model_gru_path = os.path.join(models_folder, f'{cc}_gru_model.pt')
-        
-        torch.save(gru_model.state_dict(), model_gru_path)
-        print(f"\n💾 Models saved:")
-        print(f"   {model_gru_path}")
-    
-    print("\n✅ Part 2 (Forecasting with SARIMAX + GRU) Complete!")
+                y_hist = y.loc[:step_ts]
+                ref_df = df.loc[:step_ts]
+            X_hist = None
+            Xf = None
+            if config['forecasting'].get('use_exogenous', True):
+                try:
+                    from .exogenous_features import build_exogenous
+                except ImportError:
+                    from exogenous_features import build_exogenous
+                X_hist = build_exogenous(
+                    ref_df,
+                    include_calendar=include_calendar,
+                    include_wind=include_wind,
+                    include_solar=include_solar,
+                )
+                Xf = build_future_exogenous(
+                    step_ts,
+                    periods=horizon,
+                    include_calendar=include_calendar,
+                    include_wind=include_wind,
+                    include_solar=include_solar,
+                    reference_df=ref_df
+                )
+            try:
+                model = SARIMAX(y_hist, exog=X_hist, order=order, seasonal_order=seasonal_order,
+                                enforce_stationarity=False, enforce_invertibility=False)
+                res = model.fit(disp=False)
+
+                fc = res.get_forecast(steps=horizon, exog=Xf)
+                mean = fc.predicted_mean
+                conf_int = fc.conf_int(alpha=alpha)
+                lo = conf_int.iloc[:, 0]
+                hi = conf_int.iloc[:, 1]
+
+                step_df = pd.DataFrame({
+                    'timestamp': mean.index,
+                    'yhat': mean.values,
+                    'lo': lo.values,
+                    'hi': hi.values,
+                })
+                step_df['horizon'] = np.arange(1, len(step_df) + 1)
+                step_df['train_end'] = step_ts
+                step_df = step_df.set_index('timestamp').join(y.rename('y_true'))
+                step_df = step_df.reset_index()
+
+                step_df = step_df[(step_df['timestamp'] > step_ts) & (step_df['timestamp'] <= end_ts)]
+                rows.append(step_df)
+            except Exception as e:
+                _log(f"[{cc or ''}][{label}] step at {step_ts} failed: {e}")
+
+            step_idx += 1
+            elapsed = time.time() - loop_start
+            if avg_sec is None:
+                avg_sec = elapsed
+            else:
+                avg_sec = 0.9 * avg_sec + 0.1 * elapsed
+            if (step_idx % progress_every == 0) or (step_idx == total_steps):
+                eta_sec = max(0.0, (total_steps - step_idx) * (avg_sec or 0.0))
+                _log(f"[{cc or ''}][{label}] {step_idx}/{total_steps} steps | avg {avg_sec:.2f}s/step | ETA {eta_sec/60:.1f}m")
+
+            step_ts = step_ts + pd.Timedelta(hours=stride)
+
+        if rows:
+            out = pd.concat(rows, ignore_index=True)
+            out.sort_values(['timestamp', 'horizon'], inplace=True)
+            return out
+        else:
+            return pd.DataFrame(columns=['timestamp', 'y_true', 'yhat', 'lo', 'hi', 'horizon', 'train_end'])
+
+    dev_fc = run_segment(train_end_ts, dev_end_ts, label='DEV')
+    test_fc = run_segment(dev_end_ts, idx[-1], label='TEST')
+    return dev_fc, test_fc
 
 
-def main(config_path='src/config.yaml'):
-    """Run forecasting with both SARIMAX and GRU"""
-    dfs = load_tidy_country_csvs_from_config(config_path)
-    
-    if not dfs:
-        print("❌ No countries loaded!")
-        return
-    
-    forecast_models_combined(dfs, config_path)
+def calculate_metrics(df: pd.DataFrame, seasonality: int = 24) -> Dict[str, float]:
+    # Metrics: MASE(primary), sMAPE, MSE, RMSE, MAPE, 80% PI coverage
+    y_true = df['y_true'].values
+    yhat = df['yhat'].values
+    lo = df['lo'].values
+    hi = df['hi'].values
+
+    # Drop NaNs
+    mask = ~np.isnan(y_true) & ~np.isnan(yhat)
+    y_true = y_true[mask]
+    yhat = yhat[mask]
+    lo = lo[mask]
+    hi = hi[mask]
+
+    n = len(y_true)
+    if n == 0:
+        return {m: np.nan for m in ['MASE', 'sMAPE', 'MSE', 'RMSE', 'MAPE', 'PI_80_Coverage']}
+
+    # MASE: mean absolute scaled error
+    # scale by in-sample naive seasonal forecast error
+    y = y_true  # current window, but normally use training series or stable base
+    naive_forecast_error = np.mean(np.abs(y[seasonality:] - y[:-seasonality])) if n > seasonality else 1e-10
+    mase = np.mean(np.abs(y_true - yhat)) / (naive_forecast_error + 1e-10)
+
+    # sMAPE
+    denom = (np.abs(y_true) + np.abs(yhat)) / 2
+    smape = np.mean(np.abs(y_true - yhat) / (denom + 1e-10)) * 100
+
+    # MSE/RMSE
+    mse = np.mean((y_true - yhat) ** 2)
+    rmse = np.sqrt(mse)
+
+    # MAPE
+    mape = np.mean(np.abs((y_true - yhat) / (y_true + 1e-10))) * 100
+
+    # 80% PI coverage
+    pi_covered = np.mean((y_true >= lo) & (y_true <= hi))
+
+    return {
+        'MASE': mase,
+        'sMAPE': smape,
+        'MSE': mse,
+        'RMSE': rmse,
+        'MAPE': mape,
+        'PI_80_Coverage': pi_covered
+    }
+
+
+def run(config_path: str = DEFAULT_CONFIG_PATH):
+    _log("Reading config and preparing outputs...")
+    cfg = _read_config(config_path)
+    outputs = cfg.get('outputs', {})
+    out_folder = outputs.get('forecasts_folder') or outputs.get('folder', 'outputs')
+    os.makedirs(out_folder, exist_ok=True)
+
+    # Load data
+    _log("Loading tidy country data...")
+    dfs_by_cc = load_tidy_country_csvs_from_config(config_path)
+    _log(f"Loaded countries: {list(dfs_by_cc.keys())}")
+
+    fcfg = cfg.get('forecasting', {})
+    use_exog = bool(fcfg.get('use_exogenous', True))
+    include_calendar = bool(fcfg.get('include_calendar_features', True)) if use_exog else False
+    include_wind = bool(fcfg.get('include_wind', False)) if use_exog else False
+    include_solar = bool(fcfg.get('include_solar', False)) if use_exog else False
+    _log(f"Exogenous: use={use_exog}, calendar={include_calendar}, wind={include_wind}, solar={include_solar}")
+
+    sarima_cfg = cfg.get('sarima', {})
+
+    for cc, df in dfs_by_cc.items():
+        _log(f"[{cc}] Preparing order selection and backtest...")
+        df_idx = df.set_index('timestamp').sort_index()
+        y_all = df_idx['load'].astype(float)
+        n = len(y_all)
+        n_train = int(n * float(fcfg.get('train_ratio', 0.8)))
+        y_train = y_all.iloc[:n_train]
+        X_train = None
+        if use_exog:
+            try:
+                from .exogenous_features import build_exogenous
+            except ImportError:
+                from exogenous_features import build_exogenous
+            X_train = build_exogenous(df_idx.iloc[:n_train], include_calendar, include_wind, include_solar)
+
+        order, seasonal_order = select_sarima_order(y_train, X_train, sarima_cfg)
+        _log(f"[{cc}] Selected order={order}, seasonal_order={seasonal_order}")
+
+        dev_fc, test_fc = expanding_backtest(
+            df,
+            order,
+            seasonal_order,
+            cfg,
+            include_calendar,
+            include_wind,
+            include_solar,
+            cc=cc,
+        )
+
+        # Save forecasts
+        dev_path = os.path.join(out_folder, f"{cc}_forecasts_dev.csv")
+        test_path = os.path.join(out_folder, f"{cc}_forecasts_test.csv")
+        dev_fc.to_csv(dev_path, index=False)
+        test_fc.to_csv(test_path, index=False)
+        _log(f"[{cc}] Wrote dev forecasts -> {dev_path} ({len(dev_fc)} rows)")
+        _log(f"[{cc}] Wrote test forecasts -> {test_path} ({len(test_fc)} rows)")
+
+        # Compute metrics for dev and test
+        dev_metrics = calculate_metrics(dev_fc)
+        test_metrics = calculate_metrics(test_fc)
+
+        _log(f"[{cc}] DEV metrics: {dev_metrics}")
+        _log(f"[{cc}] TEST metrics: {test_metrics}")
 
 
 if __name__ == '__main__':
-    main()
+    run()

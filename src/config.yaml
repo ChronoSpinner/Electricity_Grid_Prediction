@@ -5,6 +5,7 @@ countries:
   - DK
   - NL
 
+
 dataset:
   input_folder: 'data'
   raw_csv: 'opsd_time_series_60min_singleindex.csv'
@@ -32,12 +33,13 @@ forecasting:
   horizon: 24          # 24-step ahead
   stride: 24           # Daily updates (24 hours)
   confidence_level: 0.80  # 80% prediction intervals
+  fit_history_days: 365    # Limit each SARIMAX fit to last N days (controls memory & speed)
   
   # SARIMAX exogenous features
-  use_exogenous: true
-  include_calendar_features: true  # Hour-of-day, day-of-week
-  include_wind: true
-  include_solar: true
+  use_exogenous: false
+  include_calendar_features: false # Hour-of-day, day-of-week
+  include_wind: false
+  include_solar: false
 
 anomaly:
   zscore_window: 336   # 14 days = 336 hours
