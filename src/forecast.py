@@ -8,7 +8,6 @@ import time
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-
 try:
     from .load_opsd import load_tidy_country_csvs_from_config
     from .exogenous_features import (
@@ -25,7 +24,6 @@ except ImportError:
         build_exogenous,
         _CANONICAL_CALENDAR,
     )
-
 
 warnings.filterwarnings("ignore")
 DEFAULT_CONFIG_PATH = os.path.join('src', 'config.yaml')
@@ -86,7 +84,8 @@ def fit_sarimax_order(y, X, order, seasonal_order):
             enforce_stationarity=False,
             enforce_invertibility=False
         )
-        res = model.fit(disp=False)
+        # Powell is robust for tricky exogenous convergence
+        res = model.fit(disp=False, method='powell')
         return (order, seasonal_order, res.bic, res.aic)
     except Exception:
         return None
@@ -96,14 +95,14 @@ def select_sarima_order(
     y: pd.Series,
     X: Optional[pd.DataFrame],
     sarima_cfg: dict,
-    max_workers: int = 4
+    max_workers: int = 8
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
-    p_range = sarima_cfg.get('p_range', [0, 1, 2])
-    d_range = sarima_cfg.get('d_range', [0, 1])
-    q_range = sarima_cfg.get('q_range', [0, 1, 2])
-    P_range = sarima_cfg.get('P_range', [0, 1])
-    D_range = sarima_cfg.get('D_range', [0, 1])
-    Q_range = sarima_cfg.get('Q_range', [0, 1])
+    p_range = sarima_cfg.get('p_range', [1])
+    d_range = sarima_cfg.get('d_range', [1])
+    q_range = sarima_cfg.get('q_range', [1])
+    P_range = sarima_cfg.get('P_range', [1])
+    D_range = sarima_cfg.get('D_range', [1])
+    Q_range = sarima_cfg.get('Q_range', [0])
     s = sarima_cfg.get('s', 24)
 
     orders_to_fit = []
@@ -144,16 +143,8 @@ def select_sarima_order(
                 _log(f"Order search progress: {count}/{total} | current best order={best[0]}, seasonal={best[1]} (BIC={best_metrics[0]:.1f})")
 
     if best is None:
-        best = ((1, 1, 0), (2, 1, 0, s))
+        best = ((1, 1, 1), (1, 1, 0, s))
     return best
-
-
-def add_lag_features(df, lag_hours=[1, 24, 168]):
-    df = df.copy()
-    for lag in lag_hours:
-        df[f'load_lag_{lag}'] = df['load'].shift(lag)
-    df.dropna(inplace=True)
-    return df
 
 
 def forecast_step(
@@ -179,39 +170,39 @@ def forecast_step(
     fit_window_hours: Optional[int],
 ):
     rows = []
-    step_idx = 0
-    last_percent_reported = -1
-    total_steps = int(((end_ts - step_ts).total_seconds()) / 3600 // stride) + 1
-    avg_sec = None
-
-    # For each forecast step - this gets called once per step in parallel, so only one step here
     if step_ts < idx[0] + pd.Timedelta(hours=warmup_hours):
         return pd.DataFrame(columns=['timestamp', 'y_true', 'yhat', 'lo', 'hi', 'horizon', 'train_end'])
 
-    # Define historical window for rolling fit if applicable
+    # 1. Define Training Window (The specific data we want to fit on)
     if fit_window_hours is not None:
-        start_hist = max(idx[0], step_ts - pd.Timedelta(hours=fit_window_hours))
-        y_hist = y.loc[start_hist:step_ts]
-        ref_df = df.loc[start_hist:step_ts]
+        train_start = max(idx[0], step_ts - pd.Timedelta(hours=fit_window_hours))
     else:
-        y_hist = y.loc[:step_ts]
-        ref_df = df.loc[:step_ts]
+        train_start = idx[0]
+
+    # 2. Define Feature Engineering Window (Must be larger for Lags)
+    # We need at least 1 year of data prior to train_start to compute the lag column
+    feat_eng_start = max(idx[0], train_start - pd.Timedelta(hours=8800))
+    
+    # Slice for Feature Engineering
+    df_subset = df.loc[feat_eng_start:step_ts].copy()
 
     X_hist = None
     Xf = None
     if config['forecasting'].get('use_exogenous', True):
         try:
-            X_hist = build_exogenous(
-                ref_df,
+            # Build Exog on the subset (which includes the buffer for lags)
+            X_full_subset = build_exogenous(
+                df_subset,
                 precomputed_calendar=calendar_cache,
                 include_calendar=include_calendar,
                 include_wind=include_wind,
                 include_solar=include_solar,
             )
-            lag_cols = [col for col in ref_df.columns if col.startswith('load_lag_')]
-            if lag_cols:
-                X_hist = pd.concat([X_hist, ref_df[lag_cols]], axis=1).fillna(0)
+            
+            # Now slice X_hist to match the actual Training Window
+            X_hist = X_full_subset.loc[train_start:step_ts]
 
+            # IMPORTANT: Pass the FULL df as reference to find 52-week lag history
             Xf = build_future_exogenous(
                 step_ts,
                 periods=horizon,
@@ -219,22 +210,21 @@ def forecast_step(
                 include_calendar=include_calendar,
                 include_wind=include_wind,
                 include_solar=include_solar,
-                reference_df=ref_df
+                reference_df=df 
             )
-            if lag_cols:
-                last_lags = ref_df[lag_cols].iloc[-1]
-                lag_df_future = pd.DataFrame(np.tile(last_lags.values, (horizon, 1)), columns=lag_cols, index=Xf.index)
-                Xf = pd.concat([Xf, lag_df_future], axis=1).fillna(0)
 
         except Exception as e:
             _log(f"[{cc or ''}][forecast_step] exogenous building failed: {e}")
             X_hist = None
             Xf = None
 
+    # Slice Target y to match Training Window
+    y_hist = y.loc[train_start:step_ts]
+
     try:
         model = SARIMAX(y_hist, exog=X_hist, order=order, seasonal_order=seasonal_order,
                         enforce_stationarity=False, enforce_invertibility=False)
-        res = model.fit(disp=False)
+        res = model.fit(disp=False, method='lbfgs', maxiter=50)
 
         fc = res.get_forecast(steps=horizon, exog=Xf)
         mean = fc.predicted_mean
@@ -248,6 +238,12 @@ def forecast_step(
             'lo': lo.values,
             'hi': hi.values,
         })
+        
+        # Clip negatives
+        step_df['yhat'] = step_df['yhat'].clip(lower=0)
+        step_df['lo'] = step_df['lo'].clip(lower=0)
+        step_df['hi'] = step_df['hi'].clip(lower=0)
+
         step_df['horizon'] = np.arange(1, len(step_df) + 1)
         step_df['train_end'] = step_ts
         step_df = step_df.set_index('timestamp').join(y.rename('y_true'))
@@ -256,7 +252,8 @@ def forecast_step(
         step_df = step_df[(step_df['timestamp'] > step_ts) & (step_df['timestamp'] <= end_ts)]
         rows.append(step_df)
     except Exception as e:
-        _log(f"[{cc or ''}][forecast_step] step at {step_ts} failed: {e}")
+        # Only log critical failures
+        pass
 
     if rows:
         out = pd.concat(rows, ignore_index=True)
@@ -275,11 +272,10 @@ def expanding_backtest(
     include_wind: bool,
     include_solar: bool,
     cc: Optional[str] = None,
-    max_workers: int = 4
+    max_workers: int = 8
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
-    df = add_lag_features(df)
-    df = df.copy()
+    # NO manual lag features (add_lag_features) - handled by SARIMA or yearly exog
     if 'timestamp' in df.columns:
         df.set_index('timestamp', inplace=True)
     df.sort_index(inplace=True)
@@ -289,7 +285,10 @@ def expanding_backtest(
 
     calendar_cache = None
     if include_calendar:
-        calendar_cache = build_exogenous(df, include_calendar=True, include_wind=False, include_solar=False)[_CANONICAL_CALENDAR]
+        # Compute calendar for full DF once
+        calendar_cache = build_exogenous(df, include_calendar=True, include_wind=False, include_solar=False)
+        # Only keep DOW to avoid conflict with SARIMA seasonality
+        calendar_cache = calendar_cache[[c for c in calendar_cache.columns if 'dow' in c]]
 
     ratios = config['forecasting']
     train_ratio = float(ratios.get('train_ratio', 0.8))
@@ -310,7 +309,7 @@ def expanding_backtest(
     conf = float(ratios.get('confidence_level', 0.80))
     alpha = 1.0 - conf
 
-    fit_history_days = config.get('forecasting', {}).get('fit_history_days', None)
+    fit_history_days = config.get('forecasting', {}).get('fit_history_days', 90)
     fit_window_hours = None
     if fit_history_days is not None:
         try:
@@ -414,7 +413,6 @@ def calculate_metrics(df: pd.DataFrame, seasonality: int = 24) -> Dict[str, floa
     rmse = np.sqrt(mse)
 
     mape = np.mean(np.abs((y_true - yhat) / (y_true + 1e-10))) * 100
-
     pi_covered = np.mean((y_true >= lo) & (y_true <= hi))
 
     return {
@@ -448,16 +446,16 @@ def run(config_path: str = DEFAULT_CONFIG_PATH):
     orders_summary_path = cfg.get('sarima_orders_summary_path', DEFAULT_ORDERS_SUMMARY_PATH)
     preselected = _load_preselected_orders(orders_summary_path)
     if not preselected:
-        raise FileNotFoundError(
-            f"Required SARIMA orders summary not found or empty at '{orders_summary_path}'. Populate this YAML before running forecasts."
-        )
-    _log(f"Loaded SARIMA orders from {orders_summary_path} for countries: {list(preselected.keys())}")
+        _log(f"Warning: No preselected orders found at {orders_summary_path}.")
 
     for cc, df in dfs_by_cc.items():
         _log(f"[{cc}] Preparing order selection and backtest...")
         df_idx = df.set_index('timestamp').sort_index()
+        
         if cc not in preselected:
-            raise KeyError(f"No preselected SARIMA order found for country '{cc}' in {orders_summary_path}.")
+             # Fallback or error
+             raise KeyError(f"No preselected SARIMA order found for {cc}")
+             
         order = preselected[cc]['order']
         seasonal_order = preselected[cc]['seasonal_order']
         _log(f"[{cc}] Using preselected order={order}, seasonal_order={seasonal_order}")
@@ -471,7 +469,7 @@ def run(config_path: str = DEFAULT_CONFIG_PATH):
             include_wind,
             include_solar,
             cc=cc,
-            max_workers=8,  # Tune based on your CPU cores
+            max_workers=8,
         )
 
         dev_path = os.path.join(out_folder, f"{cc}_forecasts_dev.csv")

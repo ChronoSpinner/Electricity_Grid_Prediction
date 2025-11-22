@@ -9,7 +9,8 @@ warnings.filterwarnings('ignore')
 def check_and_impute_weather(df, columns=['wind', 'solar']):
     for col in columns:
         if col in df.columns:
-            df[col] = df[col].fillna(method='ffill').fillna(method='bfill')
+            # Interpolate is better for weather than simple ffill/bfill
+            df[col] = df[col].interpolate(method='linear', limit_direction='both')
             df[col] = df[col].clip(lower=0)
     return df
 
@@ -34,14 +35,10 @@ def load_tidy_country_csvs_from_config(config_path='src/config.yaml'):
             continue
 
         print(f"\n🌍 Loading {cc} from {file_path}...")
-
         df = pd.read_csv(file_path)
 
-        print(f"   📊 Raw shape: {df.shape}")
-        print(f"      Columns: {list(df.columns)[:10]}...")
-
+        # Rename columns
         df = df.drop(columns=['cet_cest_timestamp'], errors='ignore')
-
         df.rename(columns={
             'utc_timestamp': 'timestamp',
             f'{cc}_load_actual_entsoe_transparency': 'load',
@@ -50,43 +47,48 @@ def load_tidy_country_csvs_from_config(config_path='src/config.yaml'):
         }, inplace=True)
 
         if 'timestamp' not in df.columns:
-            raise ValueError(f"Missing column 'timestamp' — file {file_path} columns: {list(df.columns)}")
+            raise ValueError(f"Missing column 'timestamp' — file {file_path}")
 
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        # Parse Dates
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
+        
+        # Drop rows where TIMESTAMP is garbage (unlikely, but safe)
+        df.dropna(subset=['timestamp'], inplace=True)
+        
+        # Set Index and Sort
+        df.set_index('timestamp', inplace=True)
+        df.sort_index(inplace=True)
+        
+        # --- CRITICAL FIX: ENFORCE HOURLY FREQUENCY ---
+        # This inserts missing rows if any hours are skipped in the CSV
+        # It prevents .shift() from misaligning data later.
+        df = df.asfreq('H')
+        
+        # Impute LOAD (Target) - Small gaps only
+        # If we have a 1-2 hour gap, linear interpolation is safe.
+        # If 'load' was missing, asfreq created a NaN. We fill it now.
+        if 'load' in df.columns:
+            missing_load = df['load'].isna().sum()
+            if missing_load > 0:
+                print(f"   ⚠️ Found {missing_load} missing load hours. Interpolating...")
+                df['load'] = df['load'].interpolate(method='time', limit=24)
+                
+                # If gaps are huge (>24h), we might still have NaNs. Drop those edges.
+                df.dropna(subset=['load'], inplace=True)
 
-        if 'load' not in df.columns:
-            raise ValueError(f"No 'load' column found in {file_path}. Columns: {list(df.columns)}")
-
-        before_drop = len(df)
-        df.dropna(subset=['load'], inplace=True)
-        after_drop = len(df)
-
-        if before_drop > after_drop:
-            print(f"   🗑️  Dropped {before_drop - after_drop} rows with NaN in load")
-
-        # Impute missing wind and solar data only, no time features added
+        # Impute Wind/Solar
         df = check_and_impute_weather(df)
 
-        df.sort_values('timestamp', inplace=True)
-        df.reset_index(drop=True, inplace=True)
+        # Reset index for compatibility with the rest of your pipeline
+        df.reset_index(inplace=True)
 
         dfs[cc] = df
 
-        print(f"   ✅ Loaded {len(df)} rows")
-        print(f"      Columns: {list(df.columns)}")
+        print(f"   ✅ Loaded {len(df)} rows (Hourly aligned)")
         print(f"      Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
 
     print("\n" + "=" * 80)
-    print(f"✅ Successfully loaded {len(dfs)} countries: {list(dfs.keys())}")
-    print("=" * 80 + "\n")
-
     return dfs
-
 
 if __name__ == '__main__':
     dfs = load_tidy_country_csvs_from_config()
-    for cc, df in dfs.items():
-        print(f"\n{cc} - First 5 rows:")
-        print(df.head())
-        print(f"\n{cc} - Statistics:")
-        print(df.describe())

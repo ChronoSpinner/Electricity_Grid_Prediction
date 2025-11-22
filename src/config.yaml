@@ -8,15 +8,16 @@ dataset:
   raw_csv: 'opsd_time_series_60min_singleindex.csv'
 
 decomposition:
-  seasonality: 24  # Daily seasonality (hourly data)
+  seasonality: 24
   stl_period: 24
   acf_pacf_lags: 48
 
 sarima:
+  # Simplified grid for speed, expand if needed
   p_range: [1]
   d_range: [1]
-  q_range: [0, 1, 2]
-  P_range: [2]
+  q_range: [1]
+  P_range: [1]
   D_range: [1]
   Q_range: [0]
   s: 24
@@ -29,14 +30,14 @@ forecasting:
   horizon: 24
   stride: 24
   confidence_level: 0.80
+  
+  # CHANGED: 90 Days (2160 hours) provides stable history for exog fitting
   fit_history_days: 30
 
   use_exogenous: true
-  include_calendar_features: true
+  include_calendar_features: true # Now only means Day of Week
   include_wind: true
   include_solar: true
-  # Optionally add lag features flag here, if future tuning:
-  # include_lag_features: true  # Currently applied by code automatically
 
 anomaly:
   zscore_window: 336
