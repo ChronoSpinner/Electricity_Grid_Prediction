@@ -5,7 +5,6 @@ countries:
   - DK
   - NL
 
-
 dataset:
   input_folder: 'data'
   raw_csv: 'opsd_time_series_60min_singleindex.csv'
@@ -41,27 +40,29 @@ forecasting:
   include_wind: false
   include_solar: false
 
+# Part 3: Anomaly Detection
 anomaly:
+  # Part 3.1: Z-score + CUSUM
   zscore_window: 336   # 14 days = 336 hours
   zscore_threshold: 3.0
   zscore_min_periods: 168  # 7 days
+  use_cusum: true      # ✅ ADDED for Part 3.1
   cusum_k: 0.5
   cusum_h: 5.0
-  cusum_threshold: 3.0
-
-anomaly_ml:
+  
+  # Part 3.2: ML Classifier
   high_z_threshold: 3.5
   med_z_threshold: 2.5
   low_z_threshold: 1.0
   test_sample_size: 100  # 50 positive, 50 negative
-  
-live_simulation:
-  start_history_days: 120
-  simulate_hours: 2000
-  adaptation_strategy: 'rolling_sarimax'  # Options: 'rolling_sarimax', 'tiny_neural'
-  rolling_sarimax_days: 90
-  neural_finetune_days: 14
-  drift_threshold: 0.95  # 95th percentile EWMA
+
+# Part 4: Live Simulation
+live:
+  country: BE          
+  initial_history_days: 120
+  simulation_hours: 2000
+  refit_window_days: 90
+  strategy: rolling_sarima 
 
 metrics:
   seasonality: 24
