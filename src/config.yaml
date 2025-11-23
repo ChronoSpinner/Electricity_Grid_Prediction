@@ -1,7 +1,8 @@
 # OPSD PowerDesk Assignment Configuration
 
 countries:
-  - BE
+  - DK
+  - NL
 
 dataset:
   input_folder: 'data'
