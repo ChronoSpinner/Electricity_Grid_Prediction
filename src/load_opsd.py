@@ -1,11 +1,3 @@
-"""
-load_opsd.py
-------------
-Load tidy per-country CSVs (BE, DK, NL)
-Each CSV contains: timestamp, load, wind (optional), solar (optional)
-Uses the provided data loading logic from the reference repository
-"""
-
 import pandas as pd
 import yaml
 import os
@@ -14,20 +6,16 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+def check_and_impute_weather(df, columns=['wind', 'solar']):
+    for col in columns:
+        if col in df.columns:
+            # Interpolate is better for weather than simple ffill/bfill
+            df[col] = df[col].interpolate(method='linear', limit_direction='both')
+            df[col] = df[col].clip(lower=0)
+    return df
+
+
 def load_tidy_country_csvs_from_config(config_path='src/config.yaml'):
-    """
-    Read 3 separate tidy CSVs per country as per config settings
-    Each CSV contains timestamp, load, wind (optional), solar (optional)
-    
-    Uses the provided data loading logic:
-    - Drop optional 'cet_cest_timestamp' column
-    - Rename columns to standard names
-    - Convert timestamp to datetime
-    - Drop rows with missing load
-    - Sort by timestamp
-    
-    Returns: {country_code: DataFrame}
-    """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -35,9 +23,9 @@ def load_tidy_country_csvs_from_config(config_path='src/config.yaml'):
     input_folder = config['dataset']['input_folder']
     dfs = {}
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("LOADING COUNTRY DATA FROM CSV FILES")
-    print("="*80)
+    print("=" * 80)
 
     for cc in countries:
         file_path = os.path.join(input_folder, f"{cc}.csv")
@@ -47,16 +35,10 @@ def load_tidy_country_csvs_from_config(config_path='src/config.yaml'):
             continue
 
         print(f"\n🌍 Loading {cc} from {file_path}...")
-        
         df = pd.read_csv(file_path)
-        
-        print(f"   📊 Raw shape: {df.shape}")
-        print(f"      Columns: {list(df.columns)[:10]}...")
 
-        # Safely drop optional column
+        # Rename columns
         df = df.drop(columns=['cet_cest_timestamp'], errors='ignore')
-
-        # Rename known columns to standard names (missing keys are ignored)
         df.rename(columns={
             'utc_timestamp': 'timestamp',
             f'{cc}_load_actual_entsoe_transparency': 'load',
@@ -64,52 +46,49 @@ def load_tidy_country_csvs_from_config(config_path='src/config.yaml'):
             f'{cc}_wind_generation_actual': 'wind'
         }, inplace=True)
 
-        # Ensure timestamp exists and convert to datetime
         if 'timestamp' not in df.columns:
-            raise ValueError(
-                f"Missing column 'timestamp' — file {file_path} columns: {list(df.columns)}"
-            )
+            raise ValueError(f"Missing column 'timestamp' — file {file_path}")
 
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-
-        # Ensure load exists
-        if 'load' not in df.columns:
-            raise ValueError(
-                f"No 'load' column found in {file_path}. Columns: {list(df.columns)}"
-            )
-
-        # Drop rows with missing load
-        before_drop = len(df)
-        df.dropna(subset=['load'], inplace=True)
-        after_drop = len(df)
+        # Parse Dates
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
         
-        if before_drop > after_drop:
-            print(f"   🗑️  Dropped {before_drop - after_drop} rows with NaN in load")
+        # Drop rows where TIMESTAMP is garbage (unlikely, but safe)
+        df.dropna(subset=['timestamp'], inplace=True)
+        
+        # Set Index and Sort
+        df.set_index('timestamp', inplace=True)
+        df.sort_index(inplace=True)
+        
+        # --- CRITICAL FIX: ENFORCE HOURLY FREQUENCY ---
+        # This inserts missing rows if any hours are skipped in the CSV
+        # It prevents .shift() from misaligning data later.
+        df = df.asfreq('H')
+        
+        # Impute LOAD (Target) - Small gaps only
+        # If we have a 1-2 hour gap, linear interpolation is safe.
+        # If 'load' was missing, asfreq created a NaN. We fill it now.
+        if 'load' in df.columns:
+            missing_load = df['load'].isna().sum()
+            if missing_load > 0:
+                print(f"   ⚠️ Found {missing_load} missing load hours. Interpolating...")
+                df['load'] = df['load'].interpolate(method='time', limit=24)
+                
+                # If gaps are huge (>24h), we might still have NaNs. Drop those edges.
+                df.dropna(subset=['load'], inplace=True)
 
-        # Sort by timestamp
-        df.sort_values('timestamp', inplace=True)
-        df.reset_index(drop=True, inplace=True)
+        # Impute Wind/Solar
+        df = check_and_impute_weather(df)
+
+        # Reset index for compatibility with the rest of your pipeline
+        df.reset_index(inplace=True)
 
         dfs[cc] = df
 
-        print(f"   ✅ Loaded {len(df)} rows")
-        print(f"      Columns: {list(df.columns)}")
+        print(f"   ✅ Loaded {len(df)} rows (Hourly aligned)")
         print(f"      Date range: {df['timestamp'].min()} to {df['timestamp'].max()}")
 
-    print("\n" + "="*80)
-    print(f"✅ Successfully loaded {len(dfs)} countries: {list(dfs.keys())}")
-    print("="*80 + "\n")
-
+    print("\n" + "=" * 80)
     return dfs
 
-
 if __name__ == '__main__':
-    # Load data using config
     dfs = load_tidy_country_csvs_from_config()
-    
-    # Print sample data
-    for cc, df in dfs.items():
-        print(f"\n{cc} - First 5 rows:")
-        print(df.head())
-        print(f"\n{cc} - Statistics:")
-        print(df.describe())
