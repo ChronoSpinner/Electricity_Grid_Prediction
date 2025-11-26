@@ -1,0 +1,28 @@
+================================================================================
+FINAL TEST SET COMPARISON REPORT: SARIMA vs GRU
+================================================================================
+
+MODELS EVALUATED:
+  1. SARIMA - Seasonal ARIMA (statistical baseline)
+  2. GRU    - Gated Recurrent Unit (deep learning)
+
+TEST SET PERFORMANCE:
+
+BE:
+  Best Model (MASE):  SARIMA - 0.6767
+  Worst Model (MASE): GRU - 1.1888
+  MASE Improvement: 43.1%
+
+DK:
+  Best Model (MASE):  SARIMA - 0.6790
+  Worst Model (MASE): GRU - 0.7000
+  MASE Improvement: 3.0%
+
+NL:
+  Best Model (MASE):  SARIMA - 0.7040
+  Worst Model (MASE): GRU - 1.7488
+  MASE Improvement: 59.7%
+
+OVERALL METRICS (Averaged across all countries):
+  SARIMA  : MASE=0.6866 | sMAPE=2.00% | RMSE=480.05 | PI80=88.0%
+  GRU     : MASE=1.2125 | sMAPE=1.90% | RMSE=473.34 | PI80=84.1%

@@ -171,7 +171,7 @@ def forecast_step(
 ):
     rows = []
     if step_ts < idx[0] + pd.Timedelta(hours=warmup_hours):
-        return pd.DataFrame(columns=['timestamp', 'y_true', 'yhat', 'lo', 'hi', 'horizon', 'train_end'])
+        return pd.DataFrame(columns=['timestamp', 'y_true', 'yhat', 'lo', 'hi', 'horizon', 'trainend'])
 
     # 1. Define Training Window (The specific data we want to fit on)
     if fit_window_hours is not None:
@@ -472,8 +472,8 @@ def run(config_path: str = DEFAULT_CONFIG_PATH):
             max_workers=8,
         )
 
-        dev_path = os.path.join(out_folder, f"{cc}_forecasts_dev.csv")
-        test_path = os.path.join(out_folder, f"{cc}_forecasts_test.csv")
+        dev_path = os.path.join(out_folder, f"{cc}_sarima_forecasts_dev.csv")
+        test_path = os.path.join(out_folder, f"{cc}_sarima_forecasts_test.csv")
         dev_fc.to_csv(dev_path, index=False)
         test_fc.to_csv(test_path, index=False)
         _log(f"[{cc}] Wrote dev forecasts -> {dev_path} ({len(dev_fc)} rows)")

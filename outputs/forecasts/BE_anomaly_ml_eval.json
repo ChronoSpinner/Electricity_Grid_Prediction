@@ -1,0 +1,10 @@
+{
+  "pr_auc": 1.0,
+  "f1_at_p80": 0.8823529411764706,
+  "precision_at_p80": 0.7894736842105263,
+  "recall_at_p80": 1.0,
+  "threshold_at_p80": 1.9563276504103573e-06,
+  "n_train": 70,
+  "n_test": 30,
+  "n_positive_test": 15
+}

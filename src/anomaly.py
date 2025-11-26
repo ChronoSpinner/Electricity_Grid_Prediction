@@ -233,7 +233,7 @@ def run_anomaly_detection(config_path: str = 'src/config.yaml'):
     # Process each country
     results = {}
     for cc in country_codes:
-        test_forecasts_path = os.path.join(output_folder, f'{cc}_forecasts_test.csv')
+        test_forecasts_path = os.path.join(output_folder, f'{cc}_sarima_forecasts_test.csv')
         
         if not os.path.exists(test_forecasts_path):
             print(f"\n⚠️  Warning: {test_forecasts_path} not found. Skipping {cc}.")

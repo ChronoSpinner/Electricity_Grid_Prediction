@@ -149,7 +149,7 @@ def run_drift_impact_analysis(
         print(f"   {idx}. {event['timestamp']}")
     
     # ✅ Load EXISTING test forecasts (generated in Part 2)
-    forecasts_path = os.path.join(output_folder, f'{cc}_forecasts_test.csv')
+    forecasts_path = os.path.join(output_folder, f'{cc}_sarima_forecasts_test.csv')
     if not os.path.exists(forecasts_path):
         print(f"\n❌ Test forecasts not found: {forecasts_path}")
         print(f"   Run forecast.py first!")

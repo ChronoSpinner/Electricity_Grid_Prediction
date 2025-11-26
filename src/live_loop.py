@@ -335,7 +335,7 @@ def run_live_simulation(config_path: str = 'src/config.yaml'):
     
     # ✅ Load pre-generated forecasts
     output_folder = config.get('outputs', {}).get('forecasts_folder', 'outputs')
-    forecasts_path = os.path.join(output_folder, f'{live_country}_forecasts_test.csv')
+    forecasts_path = os.path.join(output_folder, f'{live_country}_sarima_forecasts_test.csv')
     
     if not os.path.exists(forecasts_path):
         print(f"❌ Error: Test forecasts not found: {forecasts_path}")

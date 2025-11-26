@@ -30,7 +30,7 @@ def load_config(config_path='src/config.yaml'):
 @st.cache_data
 def load_forecasts(cc, split='test', folder='outputs'):
     """Load forecast data"""
-    path = os.path.join(folder, f'{cc}_forecasts_{split}.csv')
+    path = os.path.join(folder, f'{cc}_sarima_forecasts_{split}.csv')
     if os.path.exists(path):
         df = pd.read_csv(path)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
