@@ -1,6 +1,7 @@
 # OPSD PowerDesk Assignment Configuration
 
 countries:
+  - BE
   - DK
   - NL
 
@@ -9,58 +10,59 @@ dataset:
   raw_csv: 'opsd_time_series_60min_singleindex.csv'
 
 decomposition:
-  seasonality: 24
+  seasonality: 24  # Daily seasonality (hourly data)
   stl_period: 24
   acf_pacf_lags: 48
 
 sarima:
-  # Simplified grid for speed, expand if needed
-  p_range: [1]
-  d_range: [1]
-  q_range: [1]
-  P_range: [1]
-  D_range: [1]
-  Q_range: [0]
+  # Grid search ranges (as per PDF defaults)
+  p_range: [0,1] #analized from PACF plot
+  d_range: [1] # slight trend in the data, observing acf and pacf at d=0 and d=1 with D=1 at d=0 the acf plot was decaying constantly but at d=1 it shows spikes at lag 1 strongly signifying d=1 and p=1 as well
+  q_range: [0,1,2] # couldnt accuratly determine from ACF plot for different countries
+  P_range: [1,2] # from seasonal PACF plot
+  D_range: [1] # visisble seasonal difference
+  Q_range: [0] #from seasonal ACF plot
   s: 24
 
 forecasting:
-  train_ratio: 0.8
-  val_ratio: 0.1
-  test_ratio: 0.1
-  warmup_days: 60
-  horizon: 24
-  stride: 24
-  confidence_level: 0.80
+  train_ratio: 0.80
+  val_ratio: 0.10
+  test_ratio: 0.10
+  warmup_days: 60      # Minimum 60 days of history
+  horizon: 24          # 24-step ahead
+  stride: 24           # Daily updates (24 hours)
+  confidence_level: 0.80  # 80% prediction intervals
+  fit_history_days: 365    # Limit each SARIMAX fit to last N days (controls memory & speed)
   
-  # CHANGED: 90 Days (2160 hours) provides stable history for exog fitting
-  fit_history_days: 30
+  # SARIMAX exogenous features
+  use_exogenous: false
+  include_calendar_features: false # Hour-of-day, day-of-week
+  include_wind: false
+  include_solar: false
 
-  use_exogenous: true
-  include_calendar_features: true # Now only means Day of Week
-  include_wind: true
-  include_solar: true
-
+# Part 3: Anomaly Detection
 anomaly:
-  zscore_window: 336
+  # Part 3.1: Z-score + CUSUM
+  zscore_window: 336   # 14 days = 336 hours
   zscore_threshold: 3.0
-  zscore_min_periods: 168
+  zscore_min_periods: 168  # 7 days
+  use_cusum: true      # ✅ ADDED for Part 3.1
   cusum_k: 0.5
   cusum_h: 5.0
-  cusum_threshold: 3.0
-
-anomaly_ml:
+  
+  # Part 3.2: ML Classifier
   high_z_threshold: 3.5
   med_z_threshold: 2.5
   low_z_threshold: 1.0
-  test_sample_size: 100
+  test_sample_size: 100  # 50 positive, 50 negative
 
-live_simulation:
-  start_history_days: 120
-  simulate_hours: 2000
-  adaptation_strategy: 'rolling_sarimax'
-  rolling_sarimax_days: 90
-  neural_finetune_days: 14
-  drift_threshold: 0.95
+# Part 4: Live Simulation
+live:
+  country: BE          
+  initial_history_days: 120
+  simulation_hours: 2000
+  refit_window_days: 90
+  strategy: rolling_sarima 
 
 metrics:
   seasonality: 24
