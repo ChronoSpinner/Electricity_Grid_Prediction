@@ -1,12 +1,5 @@
 """
-dashboard_app.py - Interactive Dashboard (Part 6) - SYNTAX FIXED
-=================================================================
-
-Streamlit dashboard for monitoring forecasts, anomalies, and online updates.
-
-Run with: streamlit run src/dashboard_app.py
-
-FIX: Line 245 syntax error (extra closing parenthesis) corrected
+dashboard_app.py - Interactive Dashboard
 """
 
 import streamlit as st
@@ -17,405 +10,266 @@ import plotly.express as px
 from datetime import datetime, timedelta
 import os
 import yaml
-import json
 
+st.set_page_config(page_title="OPSD PowerDesk Dashboard", page_icon="⚡", layout="wide")
+
+# --- 1. ROBUST FILE LOADER ---
+def find_file(filename, default_folder='outputs/forecasts'):
+    """Search for a file in common locations"""
+    candidates = [
+        os.path.join(default_folder, filename),           # outputs/file.csv
+        filename,                                         # ./file.csv (root)
+        os.path.join('..', default_folder, filename),     # ../outputs/file.csv
+        os.path.join('.', default_folder, filename)       # ./outputs/file.csv
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
 
 @st.cache_data
 def load_config(config_path='src/config.yaml'):
     """Load configuration"""
-    with open(config_path, 'r') as f:
+    # Try finding config
+    if os.path.exists(config_path):
+        path = config_path
+    elif os.path.exists('config.yaml'):
+        path = 'config.yaml'
+    else:
+        return {}
+            
+    with open(path, 'r') as f:
         return yaml.safe_load(f)
 
-
 @st.cache_data
-def load_forecasts(cc, split='test', folder='outputs'):
-    """Load forecast data"""
-    path = os.path.join(folder, f'{cc}_sarima_forecasts_{split}.csv')
-    if os.path.exists(path):
-        df = pd.read_csv(path)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        return df
+def load_forecasts(cc, split='test'):
+    """Load forecast data with smart search"""
+    # Priority: SARIMA split -> Generic split -> Full file
+    filenames = [
+        f"{cc}_sarima_forecasts_{split}.csv",
+        f"{cc}_forecasts_{split}.csv"
+    ]
+    
+    for fname in filenames:
+        path = find_file(fname)
+        if path:
+            df = pd.read_csv(path)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            if df['timestamp'].dt.tz is not None:
+                df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+            return df
     return None
 
-
 @st.cache_data
-def load_anomalies(cc, folder='outputs'):
+def load_anomalies(cc):
     """Load anomaly data"""
-    path = os.path.join(folder, f'{cc}_anomalies.csv')
-    if os.path.exists(path):
+    path = find_file(f"{cc}_anomalies.csv")
+    if path:
         df = pd.read_csv(path)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
+        if df['timestamp'].dt.tz is not None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
         return df
     return None
 
-
 @st.cache_data
-def load_updates(cc, folder='outputs'):
+def load_updates(cc):
     """Load online updates log"""
-    path = os.path.join(folder, f'{cc}_online_updates.csv')
-    if os.path.exists(path):
+    path = find_file(f"{cc}_online_updates.csv")
+    if path:
         df = pd.read_csv(path)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
+        if df['timestamp'].dt.tz is not None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
         return df
     return None
 
+# --- 2. VISUALIZATION FUNCTIONS ---
 
-@st.cache_data
-def load_metrics(cc, folder='outputs/metrics'):
-    """Load metrics summary"""
-    path = os.path.join(folder, f'{cc}_metrics_summary.json')
-    if os.path.exists(path):
-        with open(path, 'r') as f:
-            return json.load(f)
-    return None
-
-
-def calculate_rolling_mase(df, window=7*24, seasonality=24):
-    """Calculate rolling MASE"""
-    residuals = df['y_true'] - df['yhat']
-    mae = residuals.abs().rolling(window=window, min_periods=24).mean()
+def plot_live_series(df, current_ts, window_hours=168, future_hours=24):
+    """Plot historical data + forecast cone"""
+    start_plot = current_ts - timedelta(hours=window_hours)
+    end_plot = current_ts + timedelta(hours=future_hours)
     
-    # Naive seasonal MAE
-    naive_errors = np.abs(df['y_true'].diff(seasonality))
-    mae_naive = naive_errors.rolling(window=window, min_periods=seasonality).mean()
+    mask = (df['timestamp'] >= start_plot) & (df['timestamp'] <= end_plot)
+    plot_df = df.loc[mask].copy()
     
-    mase = mae / mae_naive
-    return mase
-
-
-def calculate_rolling_coverage(df, window=7*24):
-    """Calculate rolling 80% PI coverage"""
-    within = ((df['y_true'] >= df['lo']) & (df['y_true'] <= df['hi'])).astype(int)
-    coverage = 100 * within.rolling(window=window, min_periods=24).mean()
-    return coverage
-
-
-def plot_live_series(df, days=14):
-    """Plot live series with actual and forecast"""
-    # Last N days
-    cutoff = df['timestamp'].max() - timedelta(days=days)
-    df_plot = df[df['timestamp'] >= cutoff].copy()
+    history_df = plot_df[plot_df['timestamp'] <= current_ts]
+    future_df = plot_df[plot_df['timestamp'] > current_ts]
     
     fig = go.Figure()
     
-    # Actual
+    # 1. Actual Load
     fig.add_trace(go.Scatter(
-        x=df_plot['timestamp'],
-        y=df_plot['y_true'],
-        mode='lines',
-        name='Actual',
+        x=history_df['timestamp'], y=history_df['y_true'],
+        mode='lines', name='Actual Load',
         line=dict(color='#1f77b4', width=2)
     ))
     
-    # Forecast
-    fig.add_trace(go.Scatter(
-        x=df_plot['timestamp'],
-        y=df_plot['yhat'],
-        mode='lines',
-        name='Forecast',
-        line=dict(color='#ff7f0e', width=2, dash='dot')
-    ))
-    
-    fig.update_layout(
-        title=f'Load: Last {days} Days (Actual vs Forecast)',
-        xaxis_title='Timestamp',
-        yaxis_title='Load (MW)',
-        hovermode='x unified',
-        template='plotly_white',
-        height=400
-    )
-    
-    return fig
-
-
-def plot_forecast_cone(df, hours=24):
-    """Plot next 24h forecast with prediction interval"""
-    # Last 24 hours
-    df_plot = df.tail(hours).copy()
-    
-    fig = go.Figure()
-    
-    # Prediction interval (shaded)
-    fig.add_trace(go.Scatter(
-        x=df_plot['timestamp'],
-        y=df_plot['hi'],
-        mode='lines',
-        name='80% PI Upper',
-        line=dict(width=0),
-        showlegend=False,
-        hoverinfo='skip'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=df_plot['timestamp'],
-        y=df_plot['lo'],
-        mode='lines',
-        name='80% PI Lower',
-        line=dict(width=0),
-        fillcolor='rgba(255, 127, 14, 0.2)',
-        fill='tonexty',
-        showlegend=True,
-        hoverinfo='skip'
-    ))
-    
-    # Mean forecast
-    fig.add_trace(go.Scatter(
-        x=df_plot['timestamp'],
-        y=df_plot['yhat'],
-        mode='lines+markers',
-        name='Forecast Mean',
-        line=dict(color='#ff7f0e', width=3),
-        marker=dict(size=6)
-    ))
-    
-    # Actual (if available)
-    if 'y_true' in df_plot.columns:
+    # 2. Forecast Cone
+    if not future_df.empty:
+        future_df = future_df.drop_duplicates(subset=['timestamp'], keep='first')
+        
+        # Upper Bound
         fig.add_trace(go.Scatter(
-            x=df_plot['timestamp'],
-            y=df_plot['y_true'],
-            mode='lines',
-            name='Actual',
-            line=dict(color='#1f77b4', width=2)
+            x=future_df['timestamp'], y=future_df['hi'],
+            mode='lines', line=dict(width=0), showlegend=False, name='Upper 80%'
         ))
-    
-    fig.update_layout(
-        title=f'Forecast Cone: Next {hours} Hours',
-        xaxis_title='Timestamp',
-        yaxis_title='Load (MW)',
-        hovermode='x unified',
-        template='plotly_white',
-        height=400
-    )
-    
-    return fig
-
-
-def plot_anomaly_tape(df_forecasts, df_anomalies, days=14):
-    """Plot anomaly highlights on forecast series"""
-    # Last N days
-    cutoff = df_forecasts['timestamp'].max() - timedelta(days=days)
-    df_plot = df_forecasts[df_forecasts['timestamp'] >= cutoff].copy()
-    
-    # Merge anomalies
-    df_plot = df_plot.merge(
-        df_anomalies[['timestamp', 'flag_z', 'flag_cusum']],
-        on='timestamp',
-        how='left'
-    )
-    
-    fig = go.Figure()
-    
-    # Actual line
-    fig.add_trace(go.Scatter(
-        x=df_plot['timestamp'],
-        y=df_plot['y_true'],
-        mode='lines',
-        name='Actual',
-        line=dict(color='#1f77b4', width=2)
-    ))
-    
-    # Anomaly markers (z-score)
-    df_anom_z = df_plot[df_plot['flag_z'] == 1]
-    if len(df_anom_z) > 0:
+        
+        # Lower Bound
         fig.add_trace(go.Scatter(
-            x=df_anom_z['timestamp'],
-            y=df_anom_z['y_true'],
-            mode='markers',
-            name='Anomaly (Z-score)',
-            marker=dict(color='red', size=10, symbol='x')
+            x=future_df['timestamp'], y=future_df['lo'],
+            mode='lines', line=dict(width=0), fill='tonexty',
+            fillcolor='rgba(255, 127, 14, 0.2)', showlegend=False, name='Lower 80%'
         ))
+        
+        # Mean Forecast
+        fig.add_trace(go.Scatter(
+            x=future_df['timestamp'], y=future_df['yhat'],
+            mode='lines', name='Forecast',
+            line=dict(color='#ff7f0e', width=2, dash='dash')
+        ))
+
+    # 3. Current Time Marker (Numeric Timestamp to fix TypeError)
+    line_pos = pd.to_datetime(current_ts).timestamp() * 1000
     
-    # CUSUM markers
-    if 'flag_cusum' in df_plot.columns:
-        df_anom_cusum = df_plot[df_plot['flag_cusum'] == 1]
-        if len(df_anom_cusum) > 0:
-            fig.add_trace(go.Scatter(
-                x=df_anom_cusum['timestamp'],
-                y=df_anom_cusum['y_true'],
-                mode='markers',
-                name='Anomaly (CUSUM)',
-                marker=dict(color='orange', size=8, symbol='diamond')
-            ))
+    fig.add_vline(
+        x=line_pos, 
+        line_width=2, line_dash="dot", line_color="gray",
+        annotation_text="Now", annotation_position="top right"
+    )
     
     fig.update_layout(
-        title=f'Anomaly Tape: Last {days} Days',
-        xaxis_title='Timestamp',
-        yaxis_title='Load (MW)',
-        hovermode='x unified',
-        template='plotly_white',
-        height=400
-    )  # ✅ FIX: This was line 245 - removed extra )
-    
+        title=f"Live Monitoring (Window: -{window_hours}h / +{future_hours}h)",
+        xaxis_title="Time", yaxis_title="Load (MW)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
     return fig
 
+def plot_anomaly_tape(df_anom, current_ts, window_hours=168):
+    """Visual Tape of anomalies"""
+    start_plot = current_ts - timedelta(hours=window_hours)
+    mask = (df_anom['timestamp'] >= start_plot) & (df_anom['timestamp'] <= current_ts)
+    window_anoms = df_anom.loc[mask].copy()
+    
+    if window_anoms.empty:
+        return None
+        
+    window_anoms['Status'] = 'Normal'
+    if 'flag_z' in window_anoms.columns:
+        window_anoms.loc[window_anoms['flag_z'] == 1, 'Status'] = 'Anomaly'
+    
+    fig = px.scatter(
+        window_anoms, x='timestamp', y=[1]*len(window_anoms),
+        color='Status', color_discrete_map={'Normal': '#eee', 'Anomaly': 'red'},
+        symbol='Status', symbol_map={'Normal': 'circle', 'Anomaly': 'x'},
+        height=150, title="Anomaly Tape (Last 7 Days)"
+    )
+    
+    fig.update_yaxes(visible=False, showticklabels=False)
+    fig.update_layout(xaxis_title=None, margin=dict(l=20, r=20, t=40, b=20))
+    return fig
+
+# --- 3. MAIN APP ---
 
 def main():
-    """Main dashboard app"""
-    st.set_page_config(
-        page_title="OPSD PowerDesk Dashboard",
-        page_icon="⚡",
-        layout="wide"
-    )
+    st.sidebar.title("⚡ OPSD PowerDesk")
     
-    st.title("⚡ OPSD PowerDesk: Live Monitoring Dashboard")
-    
-    # Load config
+    # Config & Data Loading
     config = load_config()
     countries = config.get('countries', ['BE', 'DK', 'NL'])
-    live_country = config.get('live', {}).get('country', 'BE')
-    output_folder = config.get('outputs', {}).get('forecasts_folder', 'outputs')
+    selected_cc = st.sidebar.selectbox("Select Country", countries, index=0)
     
-    # Sidebar: Country selector
-    st.sidebar.header("Settings")
-    selected_country = st.sidebar.selectbox(
-        "Select Country",
-        countries,
-        index=countries.index(live_country) if live_country in countries else 0
-    )
-    
-    st.sidebar.markdown(f"**Live Country:** {live_country}")
-    
-    # Load data
-    df_forecasts = load_forecasts(selected_country, 'test', output_folder)
-    df_anomalies = load_anomalies(selected_country, output_folder)
-    df_updates = load_updates(selected_country, output_folder)
-    metrics = load_metrics(selected_country, 'outputs/metrics')
+    df_forecasts = load_forecasts(selected_cc)
+    df_anomalies = load_anomalies(selected_cc)
+    df_updates = load_updates(selected_cc)
     
     if df_forecasts is None:
-        st.error(f"⚠️ No forecast data found for {selected_country}")
+        st.error(f"❌ Could not find forecast CSVs for {selected_cc}. Check your 'outputs/' folder.")
         return
+
+    # Simulation Controls
+    st.sidebar.header("🕒 Simulation Control")
+    min_date = df_forecasts['timestamp'].min()
+    max_date = df_forecasts['timestamp'].max()
     
-    # === KPI TILES ===
-    st.header("📊 Key Performance Indicators")
+    # Default to 25% through the dataset
+    default_date = min_date + (max_date - min_date) / 4
     
-    col1, col2, col3, col4 = st.columns(4)
+    selected_date = st.sidebar.date_input("Date", value=default_date, min_value=min_date.date(), max_value=max_date.date())
+    selected_hour = st.sidebar.slider("Hour (UTC)", 0, 23, 12)
     
-    # Calculate rolling metrics
-    df_forecasts['rolling_mase'] = calculate_rolling_mase(df_forecasts)
-    df_forecasts['rolling_coverage'] = calculate_rolling_coverage(df_forecasts)
+    try:
+        current_ts = pd.Timestamp(datetime.combine(selected_date, datetime.min.time())) + timedelta(hours=selected_hour)
+    except:
+        st.error("Invalid Date/Time")
+        return
+
+    if current_ts < min_date or current_ts > max_date:
+        st.warning(f"Time {current_ts} outside data range.")
+        return
+        
+    # --- KPIs ---
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     
-    with col1:
-        latest_mase = df_forecasts['rolling_mase'].iloc[-1]
-        st.metric(
-            "Rolling-7d MASE",
-            f"{latest_mase:.3f}" if not np.isnan(latest_mase) else "N/A",
-            delta=None
-        )
+    # 7-Day Window for KPIs
+    window_mask = (df_forecasts['timestamp'] > current_ts - timedelta(hours=24*7)) & (df_forecasts['timestamp'] <= current_ts)
+    recent_df = df_forecasts.loc[window_mask]
     
-    with col2:
-        latest_coverage = df_forecasts['rolling_coverage'].iloc[-1]
-        st.metric(
-            "80% PI Coverage (7d)",
-            f"{latest_coverage:.1f}%" if not np.isnan(latest_coverage) else "N/A",
-            delta=None
-        )
-    
-    with col3:
-        if df_anomalies is not None:
-            today = df_forecasts['timestamp'].max().date()
-            anomalies_today = df_anomalies[
-                df_anomalies['timestamp'].dt.date == today
-            ]['flag_z'].sum()
-            st.metric("Anomaly Hours Today", int(anomalies_today))
+    # KPI 1 & 2: Forecast Accuracy
+    if not recent_df.empty:
+        mae = np.mean(np.abs(recent_df['y_true'] - recent_df['yhat']))
+        scale = recent_df['y_true'].mean() * 0.1  # Approx scale
+        mase_est = mae / scale if scale > 0 else 0
+        kpi1.metric("7-Day MASE", f"{mase_est:.3f}")
+        
+        if 'lo' in recent_df.columns:
+            covered = ((recent_df['y_true'] >= recent_df['lo']) & (recent_df['y_true'] <= recent_df['hi'])).mean()
+            kpi2.metric("7-Day Coverage", f"{covered*100:.1f}%")
         else:
-            st.metric("Anomaly Hours Today", "N/A")
-    
-    with col4:
-        if df_updates is not None and len(df_updates) > 0:
-            last_update = df_updates['timestamp'].max()
-            st.metric("Last Update", last_update.strftime("%Y-%m-%d %H:%M"))
-        else:
-            st.metric("Last Update", "N/A")
-    
-    # === UPDATE STATUS ===
-    if df_updates is not None and len(df_updates) > 0:
-        st.header("🔄 Online Adaptation Status")
+            kpi2.metric("7-Day Coverage", "N/A")
+    else:
+        kpi1.metric("7-Day MASE", "N/A")
+        kpi2.metric("7-Day Coverage", "N/A")
         
-        last_update_row = df_updates.iloc[-1]
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.markdown(f"**Last Update:** {last_update_row['timestamp'].strftime('%Y-%m-%d %H:%M')}")
-        
-        with col2:
-            reason_emoji = "📅" if last_update_row['reason'] == 'scheduled' else "🚨"
-            st.markdown(f"**Reason:** {reason_emoji} {last_update_row['reason'].capitalize()}")
-        
-        with col3:
-            st.markdown(f"**Duration:** {last_update_row['duration_s']:.1f}s")
-        
-        # Update summary
-        st.markdown(f"""
-        **Update Summary:**
-        - Total updates: {len(df_updates)}
-        - Scheduled: {(df_updates['reason'] == 'scheduled').sum()}
-        - Drift-triggered: {(df_updates['reason'] == 'drift').sum()}
-        """)
-    
-    # === LIVE SERIES ===
-    st.header("📈 Live Series")
-    
-    days = st.slider("Days to display", 7, 30, 14)
-    fig_series = plot_live_series(df_forecasts, days=days)
-    st.plotly_chart(fig_series, use_container_width=True)
-    
-    # === FORECAST CONE ===
-    st.header("🎯 Forecast Cone")
-    
-    fig_cone = plot_forecast_cone(df_forecasts, hours=24)
-    st.plotly_chart(fig_cone, use_container_width=True)
-    
-    # === ANOMALY TAPE ===
+    # KPI 3: Anomalies Today (Cumulative)
     if df_anomalies is not None:
-        st.header("🚨 Anomaly Detection")
+        today_start = current_ts.replace(hour=0, minute=0, second=0)
+        # Count anomalies from start of day UP TO current simulation hour
+        today_mask = (df_anomalies['timestamp'] >= today_start) & (df_anomalies['timestamp'] <= current_ts)
+        anoms_today = df_anomalies.loc[today_mask, 'flag_z'].sum()
+        kpi3.metric("Anomalies (Today)", int(anoms_today), delta_color="inverse")
+    else:
+        kpi3.metric("Anomalies", "N/A (File Missing)")
         
-        fig_anomalies = plot_anomaly_tape(df_forecasts, df_anomalies, days=days)
-        st.plotly_chart(fig_anomalies, use_container_width=True)
+    # KPI 4: Last Model Refit
+    if df_updates is not None:
+        # Find updates that happened BEFORE or AT current simulation time
+        past_updates = df_updates[df_updates['timestamp'] <= current_ts]
+        if not past_updates.empty:
+            last_up = past_updates.iloc[-1]
+            time_str = last_up['timestamp'].strftime('%Y-%m-%d %H:%M')
+            kpi4.metric("Last Model Refit", last_up['reason'].title(), time_str)
+        else:
+            kpi4.metric("Last Model Refit", "None Yet")
+    else:
+        kpi4.metric("Last Model Refit", "N/A (File Missing)")
         
-        # Anomaly summary
-        st.markdown(f"""
-        **Anomaly Summary (Test Set):**
-        - Total anomalies (Z-score): {df_anomalies['flag_z'].sum()}
-        - Anomaly rate: {100 * df_anomalies['flag_z'].mean():.2f}%
-        """)
-        
-        if 'flag_cusum' in df_anomalies.columns:
-            st.markdown(f"""
-            - CUSUM anomalies: {df_anomalies['flag_cusum'].sum()}
-            - CUSUM rate: {100 * df_anomalies['flag_cusum'].mean():.2f}%
-            """)
-    
-    # === METRICS SUMMARY ===
-    if metrics is not None:
-        st.header("📊 Metrics Summary")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Dev Set")
-            if metrics['dev'] is not None:
-                st.markdown(f"""
-                - **MASE:** {metrics['dev']['MASE']:.4f}
-                - **sMAPE:** {metrics['dev']['sMAPE']:.2f}%
-                - **RMSE:** {metrics['dev']['RMSE']:.2f} MW
-                - **Coverage:** {metrics['dev']['Coverage_80%']:.2f}%
-                """)
-        
-        with col2:
-            st.subheader("Test Set")
-            if metrics['test'] is not None:
-                st.markdown(f"""
-                - **MASE:** {metrics['test']['MASE']:.4f}
-                - **sMAPE:** {metrics['test']['sMAPE']:.2f}%
-                - **RMSE:** {metrics['test']['RMSE']:.2f} MW
-                - **Coverage:** {metrics['test']['Coverage_80%']:.2f}%
-                """)
-    
-    # === FOOTER ===
     st.markdown("---")
-    st.markdown("**OPSD PowerDesk** | Day-Ahead Forecasting & Anomaly Detection System")
+    
+    # Charts
+    st.subheader("📈 Live Load & Forecast Cone")
+    fig_main = plot_live_series(df_forecasts, current_ts)
+    st.plotly_chart(fig_main, use_container_width=True)
+    
+    if df_anomalies is not None:
+        fig_tape = plot_anomaly_tape(df_anomalies, current_ts)
+        if fig_tape:
+            st.plotly_chart(fig_tape, use_container_width=True)
+            
+    with st.expander("🔎 View Underlying Data"):
+        st.dataframe(recent_df.tail(24))
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
